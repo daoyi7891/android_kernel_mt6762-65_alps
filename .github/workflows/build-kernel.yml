@@ -12,6 +12,8 @@ name: Build kernel
 
 on:
   push:
+    branches:
+      - 4.19.191-U1Pro
   workflow_dispatch:
     inputs:
       defconfig:
