@@ -12,6 +12,7 @@ name: Build kernel
 
 on:
   workflow_dispatch:
+    push:
     inputs:
       defconfig:
         description: "内核配置（arch/arm64/configs 下的文件名）"
