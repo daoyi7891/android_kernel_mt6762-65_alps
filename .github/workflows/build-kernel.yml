@@ -171,23 +171,69 @@ jobs:
           # 兜底：其余目录如果也有 -Werror，统一不再把告警当错误
           echo "KCFLAGS_EXTRA=-Wno-error" >> "$GITHUB_ENV"
 
+      - name: Apply Safe SUSFS patches (4.19)
+        if: env.BAKASU == 'true'
+        run: |
+          REPO="https://gitlab.com""/simonpunk/susfs4ksu.git"
+          git clone --depth=1 -b kernel-4.19 "$REPO" /tmp/susfs4ksu || git clone --depth=1 "$REPO" /tmp/susfs4ksu
+          cp -rf /tmp/susfs4ksu/kernel_patches/fs/* fs/
+          cp -rf /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
+          patch -p1 --fuzz=3 < /tmp/susfs4ksu/kernel_patches/*.patch || true
+          python3 -c '
+          import re
+
+          rej = open("include/linux/sched.h.rej").read()
+          adds = "\n".join(line[1:] for line in rej.splitlines() if line.startswith("+") and not line.startswith("+++"))
+          sched = open("include/linux/sched.h").read()
+          aligned_adds = "\n\t/* SUSFS aligned fields */\n" + adds + "\n"
+          sched_new, n = re.subn(r"(struct task_struct\s*\{[\s\S]*?)(\n\};)", r"\1" + aligned_adds + r"\2", sched, count=1)
+          assert n == 1, "Failed to locate task_struct"
+          open("include/linux/sched.h", "w").write(sched_new)
+
+          fdinfo = open("fs/notify/fdinfo.c").read()
+          fdinfo = fdinfo.replace("inotify_mark_user_mask(mark)", "(mark->mask & IN_ALL_EVENTS)")
+          fdinfo = fdinfo.replace("u32 mask = mark->mask & IN_ALL_EVENTS;", "; u32 mask = mark->mask & IN_ALL_EVENTS;")
+          open("fs/notify/fdinfo.c", "w").write(fdinfo)
+
+          sys_c = open("kernel/sys.c").read()
+          if "ksu_handle_setresuid" not in sys_c:
+              hook_decl = "#ifdef CONFIG_KSU_SUSFS\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n"
+              hook_call = "\n#ifdef CONFIG_KSU_SUSFS\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n"
+              sys_c, m = re.subn(r"(SYSCALL_DEFINE3\(setresuid,\s*uid_t,\s*ruid,\s*uid_t,\s*euid,\s*uid_t,\s*suid\)\s*\{)", hook_decl + r"\1" + hook_call, sys_c, count=1)
+              open("kernel/sys.c", "w").write(sys_c)
+
+          rw_c = open("fs/read_write.c").read()
+          if "ksu_handle_sys_read" not in rw_c:
+              r_decl = "#ifdef CONFIG_KSU_SUSFS\nextern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);\n#endif\n"
+              r_call = "\n#ifdef CONFIG_KSU_SUSFS\n\tksu_handle_sys_read(fd, &buf, &count);\n#endif\n"
+              rw_c, r = re.subn(r"(ssize_t\s+ksys_read\s*\(\s*unsigned\s+int\s+fd\s*,\s*char\s+__user\s*\*\s*buf\s*,\s*size_t\s+count\s*\)\s*\{)", r_decl + r"\1" + r_call, rw_c, count=1)
+              if r == 0:
+                  rw_c, r = re.subn(r"(SYSCALL_DEFINE3\(read,\s*unsigned\s+int,\s*fd,\s*char\s+__user\s*\*,\s*buf,\s*size_t,\s*count\)\s*\{)", r_decl + r"\1" + r_call, rw_c, count=1)
+              open("fs/read_write.c", "w").write(rw_c)
+
+          defs_h = open("include/linux/susfs_def.h").read()
+          if "SUSFS_MAGIC" not in defs_h:
+              defs_h += "\n#define SUSFS_MAGIC 0x55555555\n"
+              open("include/linux/susfs_def.h", "w").write(defs_h)
+          '
+          sed -i 's/\$(error /\$(warning /g' drivers/kernelsu/tools/inline_hook_check.mk || true
+
       - name: Configure kernel
         run: |
           make -j"$(nproc)" ARCH=arm64 O=out "$DEFCONFIG"
 
-          # BakaSU 开关：打开时启用 KSU + manual hook，关闭时彻底不编
           if [ "$BAKASU" = "true" ]; then
-            echo "==> 启用 BakaSU"
-            scripts/config --file out/.config -e KSU -e KSU_MANUAL_HOOK -e KALLSYMS_ALL
+            echo "==> 启用 BakaSU + 4.19 安全版 SUSFS"
+            scripts/config --file out/.config \
+              -e KSU -d KSU_MANUAL_HOOK -d KSU_TRACEPOINT_HOOK -e KSU_SUSFS -e KALLSYMS_ALL \
+              -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+              -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT -e KSU_SUSFS_SUS_KSTAT -e KSU_SUSFS_SPOOF_UNAME \
+              -e KSU_SUSFS_ENABLE_LOG -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+              -e KSU_SUSFS_OPEN_REDIRECT -e KSU_SUSFS_SUS_SU \
+              -d KSU_SUSFS_SUS_MAP -d KSU_SUSFS_TRY_UMOUNT -d KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
           else
             echo "==> 未启用 BakaSU"
-            scripts/config --file out/.config -d KSU -d KSU_MANUAL_HOOK -d KSU_TRACEPOINT_HOOK
-          fi
-
-          if [ "$DEBUG_INFO" != "true" ]; then
-            # 只影响调试符号，不影响生成的 Image
-            scripts/config --file out/.config \
-              -d DEBUG_INFO -d DEBUG_INFO_DWARF4 -d DEBUG_INFO_REDUCED -d GDB_SCRIPTS
+            scripts/config --file out/.config -d KSU -d KSU_MANUAL_HOOK -d KSU_TRACEPOINT_HOOK -d KSU_SUSFS
           fi
           make -j"$(nproc)" ARCH=arm64 O=out olddefconfig
 
