@@ -295,4 +295,3 @@ jobs:
           name: ${{ inputs.release_tag }}
           files: ${{ steps.package.outputs.zip }}
           generate_release_notes: true
-
